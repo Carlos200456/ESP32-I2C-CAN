@@ -7,7 +7,11 @@
       "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 10)",
       "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 8)",
       "Bash(command -v pio)",
-      "Bash(command -v platformio)"
+      "Bash(command -v platformio)",
+      "Bash(where pio *)",
+      "Bash(where platformio *)",
+      "Read(//tmp/**)",
+      "Bash(echo \"---exit:$?\")"
     ]
   }
 }
