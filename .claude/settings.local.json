@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; Remove-Item -Recurse -Force \".pio\\\\build\\\\esp32-c6-devkitc-1\" -ErrorAction SilentlyContinue; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 180)",
+      "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 150)",
+      "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 20)",
+      "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 10)",
+      "PowerShell(cd \"c:\\\\Users\\\\crequejo.PIM\\\\Documents\\\\PlatformIO\\\\Projects\\\\ESP32-I2C-CAN\"; & \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run 2>&1 | Select-Object -Last 8)",
+      "Bash(command -v pio)",
+      "Bash(command -v platformio)"
+    ]
+  }
+}
