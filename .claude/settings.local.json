@@ -11,7 +11,9 @@
       "Bash(where pio *)",
       "Bash(where platformio *)",
       "Read(//tmp/**)",
-      "Bash(echo \"---exit:$?\")"
+      "Bash(echo \"---exit:$?\")",
+      "Bash(pio run *)",
+      "Read(//c/Users/crequejo.PIM/.platformio/packages/framework-espidf/components/vfs/**)"
     ]
   }
 }

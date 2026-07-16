@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
@@ -11,42 +13,23 @@
 #include "driver/twai.h"
 #include "esp_log.h"
 #include "Functions.h"
+#include "Globals.h"
 
 static const char *TAG = "NODO_REMOTO";
 
-// ---------------- Configuracion I2C (AJUSTAR segun tu placa) ----------------
-#define I2C_PORT        I2C_NUM_0
-#define I2C_SDA_PIN     2
-#define I2C_SCL_PIN     3
-#define I2C_FREQ_HZ     100000
-
-// ---------------- Direcciones I2C de los sensores ----------------
-#define ADXL345_ADDR    0x53   // 0x1D si el pin SDO esta a VCC
-#define MLX90614_ADDR   0x5A
-
-// Registros ADXL345
-#define ADXL345_REG_DEVID       0x00
-#define ADXL345_REG_POWER_CTL   0x2D
-#define ADXL345_REG_DATA_FORMAT 0x31
-#define ADXL345_REG_DATAX0      0x32
-#define ADXL345_DEVID_ESPERADO  0xE5
-
-// Registros MLX90614 (RAM)
-#define MLX90614_REG_TA     0x06
-#define MLX90614_REG_TOBJ1  0x07
-
-// ---------------- Configuracion TWAI/CAN (AJUSTAR) ----------------
-#define CAN_TX_PIN   GPIO_NUM_4
-#define CAN_RX_PIN   GPIO_NUM_5
-#define CAN_ID_INCLINACION  0x200
-#define CAN_ID_TEMPERATURA  0x201
-
-#define LED_PIN GPIO_NUM_8
-
+// Estado interno, solo usado dentro de este archivo.
 static led_strip_handle_t led_strip;
-
 static uint8_t seq_inclinacion = 0;
 static uint8_t seq_temperatura = 0;
+static bool CalibracionInProgress = false; // seteado por comando CAN del Nano o teclado USB
+static int AccelMinX = 0, AccelMaxX = 0;
+static int AccelMinY = 0, AccelMaxY = 0;
+static int AccelMinZ = 0, AccelMaxZ = 0;
+
+// Estado compartido con main.c (declarado extern en Globals.h).
+bool CalibracionValida = false;
+int offsetX = 0, offsetY = 0, offsetZ = 0;
+int gainX = 255, gainY = 255, gainZ = 255;
 
 // ============================================================
 // I2C - funciones de bajo nivel
@@ -143,19 +126,14 @@ esp_err_t adxl345_init(void) {
     return err;
 }
 
-static esp_err_t adxl345_leer_g(float *ax, float *ay, float *az) {
+static esp_err_t adxl345_leer_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z) {
     uint8_t data[6];
     esp_err_t err = i2c_read_regs(ADXL345_ADDR, ADXL345_REG_DATAX0, data, sizeof(data));
     if (err != ESP_OK) return err;
 
-    int16_t raw_x = (int16_t)((data[1] << 8) | data[0]);
-    int16_t raw_y = (int16_t)((data[3] << 8) | data[2]);
-    int16_t raw_z = (int16_t)((data[5] << 8) | data[4]);
-
-    const float MG2G = 0.004f; // 4 mg/LSB en modo full-res
-    *ax = raw_x * MG2G;
-    *ay = raw_y * MG2G;
-    *az = raw_z * MG2G;
+    *raw_x = (int16_t)((data[1] << 8) | data[0]);
+    *raw_y = (int16_t)((data[3] << 8) | data[2]);
+    *raw_z = (int16_t)((data[5] << 8) | data[4]);
     return ESP_OK;
 }
 
@@ -206,7 +184,7 @@ void twai_init_bus(void) {
     twai_general_config_t g_config =
         TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
     // Elegir la linea que coincida con el bitrate del bus existente:
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_100KBITS();
     // twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
     // twai_timing_config_t t_config = TWAI_TIMING_CONFIG_125KBITS();
     // twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
@@ -226,6 +204,32 @@ void twai_chequear_bus(void) {
         vTaskDelay(pdMS_TO_TICKS(100));
         twai_start();
     }
+}
+
+// Revisa la cola de recepcion TWAI sin bloquear (timeout=0) y procesa
+// un comando si llego. Devuelve true si habia un frame para procesar,
+// para poder llamarla en loop y drenar varios comandos por iteracion.
+bool twai_recibir_comando(void) {
+    twai_message_t msg;
+    if (twai_receive(&msg, 0) != ESP_OK) {
+        return false; // no hay ningun frame pendiente
+    }
+    if (msg.identifier != CAN_ID_COMANDO || msg.data_length_code < 1) {
+        return true;
+    }
+
+    switch (msg.data[0]) {
+        case CAN_CMD_CALIBRACION_START:
+            calibracion_iniciar();
+            break;
+        case CAN_CMD_CALIBRACION_STOP:
+            calibracion_finalizar();
+            break;
+        default:
+            ESP_LOGW(TAG, "Comando CAN desconocido: 0x%02X", msg.data[0]);
+            break;
+    }
+    return true;
 }
 
 static bool twai_enviar_frame(uint32_t id, const uint8_t *datos, uint8_t largo) {
@@ -300,17 +304,31 @@ void ws2812_rainbow(uint8_t steps, TickType_t delay_ticks, uint8_t brillo) {
 // ============================================================
 
 void enviar_inclinacion(void) {
-    float ax, ay, az;
-    if (adxl345_leer_g(&ax, &ay, &az) != ESP_OK) {
+    if (!CalibracionValida) {
+        ESP_LOGW(TAG, "Sin calibracion guardada: no se envia pitch/roll. Calibrar antes de operar.");
+        ws2812_set_color(10, 8, 0); // Ambar: pendiente de calibracion
+        return;
+    }
+
+    int16_t raw_x, raw_y, raw_z;
+    if (adxl345_leer_raw(&raw_x, &raw_y, &raw_z) != ESP_OK) {
         ESP_LOGW(TAG, "Error leyendo ADXL345");
         // Cambiar el color del LED a rojo para indicar fallo de sensor
         ws2812_set_color(0, 0, 10); // Blue
         return;
     }
+    // offsetX/gainX salen de AccelMin?/AccelMax?, que se calibran en
+    // cuentas crudas (ver calibracion_paso): hay que restar/dividir en
+    // ese mismo dominio para que el resultado quede normalizado a ~1g
+    // por eje, no mezclar cuentas crudas con g ya convertidos.
+    float accX, accY, accZ;
+    accX = (float)(raw_x - offsetX) / gainX;
+    accY = (float)(raw_y - offsetY) / gainY;
+    accZ = (float)(raw_z - offsetZ) / gainZ;
 
     // Calibrar mapeo de ejes segun montaje fisico real sobre el tubo
-    float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / (float)M_PI;
-    float roll  = atan2f(ay, az) * 180.0f / (float)M_PI;
+    float pitch = atan2f(-accX, sqrtf(accY * accY + accZ * accZ)) * 180.0f / (float)M_PI;
+    float roll  = atan2f(accY, accZ) * 180.0f / (float)M_PI;
 
     int16_t pitch_centi = (int16_t)(pitch * 100.0f); // centesimas de grado
     int16_t roll_centi  = (int16_t)(roll * 100.0f);
@@ -323,6 +341,7 @@ void enviar_inclinacion(void) {
     datos[4] = seq_inclinacion++; // contador para detectar datos viejos/perdidos
 
     if (!twai_enviar_frame(CAN_ID_INCLINACION, datos, sizeof(datos))) {
+        ESP_LOGW(TAG, "Pitch=%.0f, Roll=%.0f", pitch, roll);
         ESP_LOGW(TAG, "Fallo al enviar frame de inclinacion");
     }
 }
@@ -349,6 +368,132 @@ void enviar_temperatura(void) {
     datos[4] = seq_temperatura++;
 
     if (!twai_enviar_frame(CAN_ID_TEMPERATURA, datos, sizeof(datos))) {
+        ESP_LOGW(TAG, "t_obj=%.2f, t_amb=%.2f", t_obj, t_amb);
         ESP_LOGW(TAG, "Fallo al enviar frame de temperatura");
     }
+}
+
+// Envia los extremos min/max acumulados de los 3 ejes para que el Nano
+// los muestre al usuario durante la calibracion. Van en dos frames
+// separados (min y max) porque 6 valores de 16 bits (12 bytes) no
+// entran en un solo frame CAN clasico (maximo 8 bytes de datos).
+void enviar_calibracion(int min_x, int max_x, int min_y, int max_y, int min_z, int max_z) {
+    uint8_t datos_min[6];
+    datos_min[0] = min_x & 0xFF;
+    datos_min[1] = (min_x >> 8) & 0xFF;
+    datos_min[2] = min_y & 0xFF;
+    datos_min[3] = (min_y >> 8) & 0xFF;
+    datos_min[4] = min_z & 0xFF;
+    datos_min[5] = (min_z >> 8) & 0xFF;
+
+    uint8_t datos_max[6];
+    datos_max[0] = max_x & 0xFF;
+    datos_max[1] = (max_x >> 8) & 0xFF;
+    datos_max[2] = max_y & 0xFF;
+    datos_max[3] = (max_y >> 8) & 0xFF;
+    datos_max[4] = max_z & 0xFF;
+    datos_max[5] = (max_z >> 8) & 0xFF;
+
+    bool env_min = twai_enviar_frame(CAN_ID_CALIBRACION_MIN, datos_min, sizeof(datos_min));
+    bool env_max = twai_enviar_frame(CAN_ID_CALIBRACION_MAX, datos_max, sizeof(datos_max));
+    if (!env_min || !env_max) {
+        // Nivel debug (no warning): durante una calibracion de fabrica por
+        // USB el bus CAN suele estar desconectado, y esto se repite en
+        // cada paso. No es un error real que le importe al operador.
+        ESP_LOGD(TAG, "Fallo al enviar frame de calibracion (min=(%d,%d,%d) max=(%d,%d,%d)) - normal si no hay Nano conectado",
+                 min_x, min_y, min_z, max_x, max_y, max_z);
+    }
+}
+
+// Arranca la calibracion: reinicia los extremos min/max para que el
+// primer dato leido los establezca, y prende el flag que habilita el
+// envio periodico de datos crudos (ver calibracion_paso).
+void calibracion_iniciar(void) {
+    AccelMinX = AccelMinY = AccelMinZ = INT16_MAX;
+    AccelMaxX = AccelMaxY = AccelMaxZ = INT16_MIN;
+    CalibracionInProgress = true;
+    ESP_LOGI(TAG, "Calibracion iniciada");
+}
+
+bool calibracion_en_curso(void) {
+    return CalibracionInProgress;
+}
+
+// Se llama periodicamente desde el loop principal mientras
+// calibracion_en_curso() sea true: lee el acelerometro, actualiza los
+// extremos min/max observados y los reenvia por CAN (para el Nano) y por
+// consola USB, reescribiendo una sola linea en el lugar (\r, sin \n).
+// No usamos secuencias ANSI de mover el cursor entre filas: si el
+// contenido ya llego al borde inferior de la terminal, cada \n fuerza
+// un scroll de toda la pantalla y la "linea fija" termina subiendo sin
+// parar. Con \r alcanza porque nunca cambiamos de fila.
+void calibracion_paso(void) {
+    int16_t raw_x, raw_y, raw_z;
+    if (adxl345_leer_raw(&raw_x, &raw_y, &raw_z) != ESP_OK) {
+        ESP_LOGW(TAG, "Error leyendo ADXL345 durante calibracion");
+        return;
+    }
+
+    if (raw_x < AccelMinX) AccelMinX = raw_x;
+    if (raw_x > AccelMaxX) AccelMaxX = raw_x;
+    if (raw_y < AccelMinY) AccelMinY = raw_y;
+    if (raw_y > AccelMaxY) AccelMaxY = raw_y;
+    if (raw_z < AccelMinZ) AccelMinZ = raw_z;
+    if (raw_z > AccelMaxZ) AccelMaxZ = raw_z;
+
+    enviar_calibracion(AccelMinX, AccelMaxX, AccelMinY, AccelMaxY, AccelMinZ, AccelMaxZ);
+
+    // Ancho fijo (%5d) en vez de \033[K: la terminal del usuario no
+    // interpreta esa secuencia de escape y la muestra como texto suelto.
+    // Con ancho fijo la linea siempre mide lo mismo, asi que no hace
+    // falta borrar restos del valor anterior.
+    printf("\rMin X=%5d Y=%5d Z=%5d | Max X=%5d Y=%5d Z=%5d",
+           AccelMinX, AccelMinY, AccelMinZ, AccelMaxX, AccelMaxY, AccelMaxZ);
+    // No hay ningun \n en este printf, asi que stdio no lo manda solo:
+    // forzamos el flush para que se vea en el momento y no se acumule
+    // sin transmitir hasta el proximo log con salto de linea.
+    fflush(stdout);
+    fsync(fileno(stdout));
+}
+
+// Un gain fuera de este rango indica que ese eje no roto realmente por
+// +-1g durante la calibracion (sensor quieto, mal movimiento, etc).
+static bool gain_es_plausible(int gain) {
+    return gain >= ADXL345_GAIN_MIN_ESPERADO && gain <= ADXL345_GAIN_MAX_ESPERADO;
+}
+
+// Corta el envio de datos crudos, calcula offset/gain a partir de los
+// extremos acumulados desde calibracion_iniciar() y los persiste en NVS.
+// Si el resultado no parece una calibracion real (gain nulo o fuera de
+// rango en algun eje) la descarta: no la guarda ni pisa una calibracion
+// valida anterior, para que el usuario tenga que repetirla.
+void calibracion_finalizar(void) {
+    CalibracionInProgress = false;
+    printf("\n"); // cerrar la linea que se venia reescribiendo en calibracion_paso()
+
+    int nuevo_offsetX = (AccelMaxX + AccelMinX) / 2;
+    int nuevo_gainX   = (AccelMaxX - AccelMinX) / 2;
+    int nuevo_offsetY = (AccelMaxY + AccelMinY) / 2;
+    int nuevo_gainY   = (AccelMaxY - AccelMinY) / 2;
+    int nuevo_offsetZ = (AccelMaxZ + AccelMinZ) / 2;
+    int nuevo_gainZ   = (AccelMaxZ - AccelMinZ) / 2;
+
+    if (!gain_es_plausible(nuevo_gainX) || !gain_es_plausible(nuevo_gainY) || !gain_es_plausible(nuevo_gainZ)) {
+        ESP_LOGE(TAG, "Calibracion rechazada: gain fuera de rango (esperado %d..%d) gainX=%d, gainY=%d, gainZ=%d. Repetir moviendo bien los 3 ejes.",
+                 ADXL345_GAIN_MIN_ESPERADO, ADXL345_GAIN_MAX_ESPERADO, nuevo_gainX, nuevo_gainY, nuevo_gainZ);
+        ws2812_set_color(10, 0, 0); // rojo: calibracion invalida
+        return;
+    }
+
+    offsetX = nuevo_offsetX;
+    gainX   = nuevo_gainX;
+    offsetY = nuevo_offsetY;
+    gainY   = nuevo_gainY;
+    offsetZ = nuevo_offsetZ;
+    gainZ   = nuevo_gainZ;
+    guardar_calibracion(offsetX, offsetY, offsetZ, gainX, gainY, gainZ);
+    CalibracionValida = true;
+
+    ESP_LOGI(TAG, "Calibracion finalizada: offsetX=%d, gainX=%d, offsetY=%d, gainY=%d, offsetZ=%d, gainZ=%d",
+             offsetX, gainX, offsetY, gainY, offsetZ, gainZ);
 }
