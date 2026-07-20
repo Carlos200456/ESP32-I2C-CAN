@@ -7,7 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "led_strip.h"
 #define CONFIG_TWAI_SUPPRESS_DEPRECATE_WARN 1
 #include "driver/twai.h"
@@ -18,6 +18,9 @@
 static const char *TAG = "NODO_REMOTO";
 
 // Estado interno, solo usado dentro de este archivo.
+static i2c_master_bus_handle_t i2c_bus;
+static i2c_master_dev_handle_t adxl345_dev;
+static i2c_master_dev_handle_t mlx90614_dev;
 static led_strip_handle_t led_strip;
 static uint8_t seq_inclinacion = 0;
 static uint8_t seq_temperatura = 0;
@@ -35,51 +38,49 @@ int gainX = 255, gainY = 255, gainZ = 255;
 // I2C - funciones de bajo nivel
 // ============================================================
 
-static esp_err_t i2c_write_reg(uint8_t dev_addr, uint8_t reg, uint8_t val) {
+// Nota timeouts: a diferencia del driver legacy (que tomaba ticks via
+// pdMS_TO_TICKS), i2c_master.h toma milisegundos directos.
+static esp_err_t i2c_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t val) {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_write_to_device(I2C_PORT, dev_addr, buf, sizeof(buf),
-                                       pdMS_TO_TICKS(100));
+    return i2c_master_transmit(dev, buf, sizeof(buf), 100);
 }
 
-static esp_err_t i2c_read_regs(uint8_t dev_addr, uint8_t reg, uint8_t *data, size_t len) {
-    return i2c_master_write_read_device(I2C_PORT, dev_addr, &reg, 1, data, len,
-                                         pdMS_TO_TICKS(100));
+static esp_err_t i2c_read_regs(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *data, size_t len) {
+    return i2c_master_transmit_receive(dev, &reg, 1, data, len, 100);
+}
+
+static esp_err_t i2c_agregar_dispositivo(uint16_t dev_addr, i2c_master_dev_handle_t *out_dev) {
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = dev_addr,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    return i2c_master_bus_add_device(i2c_bus, &dev_config, out_dev);
 }
 
 void i2c_init(void) {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_PORT,
         .sda_io_num = I2C_SDA_PIN,
         .scl_io_num = I2C_SCL_PIN,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus));
+    ESP_ERROR_CHECK(i2c_agregar_dispositivo(ADXL345_ADDR, &adxl345_dev));
+    ESP_ERROR_CHECK(i2c_agregar_dispositivo(MLX90614_ADDR, &mlx90614_dev));
 }
 
 // ============================================================
 // I2C - diagnostico de cableado (debug por USB Serial/JTAG)
 // ============================================================
 
-// Transaccion de solo direccion (sin datos): si el dispositivo ACKea,
-// esta presente y bien cableado en esa direccion.
-static esp_err_t i2c_probe(uint8_t dev_addr) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (dev_addr << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return err;
-}
-
 void i2c_escanear_bus(void) {
     ESP_LOGI(TAG, "Escaneando bus I2C (SDA=%d, SCL=%d)...", I2C_SDA_PIN, I2C_SCL_PIN);
     uint8_t encontrados = 0;
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
-        if (i2c_probe(addr) == ESP_OK) {
+        if (i2c_master_probe(i2c_bus, addr, 100) == ESP_OK) {
             ESP_LOGI(TAG, "  -> dispositivo I2C en 0x%02X", addr);
             encontrados++;
         }
@@ -101,7 +102,7 @@ void i2c_escanear_bus(void) {
 // ADXL345" (direccion pisada por otro dispositivo, wiring cruzado, etc).
 bool adxl345_verificar_id(void) {
     uint8_t devid = 0;
-    esp_err_t err = i2c_read_regs(ADXL345_ADDR, ADXL345_REG_DEVID, &devid, 1);
+    esp_err_t err = i2c_read_regs(adxl345_dev, ADXL345_REG_DEVID, &devid, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADXL345 (0x%02X): sin respuesta I2C (%s). Revisar SDA/SCL/VCC/GND.",
                  ADXL345_ADDR, esp_err_to_name(err));
@@ -119,16 +120,16 @@ bool adxl345_verificar_id(void) {
 esp_err_t adxl345_init(void) {
     esp_err_t err;
     // DATA_FORMAT: full-res (bit3=0x08) + rango +-4g (bits1:0=0x01)
-    err = i2c_write_reg(ADXL345_ADDR, ADXL345_REG_DATA_FORMAT, 0x08 | 0x01);
+    err = i2c_write_reg(adxl345_dev, ADXL345_REG_DATA_FORMAT, 0x08 | 0x01);
     if (err != ESP_OK) return err;
     // POWER_CTL: bit Measure = 0x08 (arranca la medicion)
-    err = i2c_write_reg(ADXL345_ADDR, ADXL345_REG_POWER_CTL, 0x08);
+    err = i2c_write_reg(adxl345_dev, ADXL345_REG_POWER_CTL, 0x08);
     return err;
 }
 
 static esp_err_t adxl345_leer_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z) {
     uint8_t data[6];
-    esp_err_t err = i2c_read_regs(ADXL345_ADDR, ADXL345_REG_DATAX0, data, sizeof(data));
+    esp_err_t err = i2c_read_regs(adxl345_dev, ADXL345_REG_DATAX0, data, sizeof(data));
     if (err != ESP_OK) return err;
 
     *raw_x = (int16_t)((data[1] << 8) | data[0]);
@@ -143,7 +144,7 @@ static esp_err_t adxl345_leer_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z
 
 static esp_err_t mlx90614_leer_temp(uint8_t reg, float *temp_c) {
     uint8_t data[3]; // LSB, MSB, PEC (PEC se lee pero no se valida)
-    esp_err_t err = i2c_read_regs(MLX90614_ADDR, reg, data, sizeof(data));
+    esp_err_t err = i2c_read_regs(mlx90614_dev, reg, data, sizeof(data));
     if (err != ESP_OK) return err;
 
     uint16_t raw = (data[1] << 8) | data[0];
@@ -156,7 +157,7 @@ static esp_err_t mlx90614_leer_temp(uint8_t reg, float *temp_c) {
 // dentro del rango util del sensor, para descartar datos basura por
 // mal cableado o SDA/SCL en corto.
 bool mlx90614_verificar(void) {
-    if (i2c_probe(MLX90614_ADDR) != ESP_OK) {
+    if (i2c_master_probe(i2c_bus, MLX90614_ADDR, 100) != ESP_OK) {
         ESP_LOGE(TAG, "MLX90614 (0x%02X): sin respuesta I2C. Revisar SDA/SCL/VCC/GND.", MLX90614_ADDR);
         return false;
     }
