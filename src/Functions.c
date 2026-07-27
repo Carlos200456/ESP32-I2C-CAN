@@ -328,8 +328,8 @@ void enviar_inclinacion(void) {
     accZ = (float)(raw_z - offsetZ) / gainZ;
 
     // Calibrar mapeo de ejes segun montaje fisico real sobre el tubo
-    float pitch = atan2f(-accX, sqrtf(accY * accY + accZ * accZ)) * 180.0f / (float)M_PI;
-    float roll  = atan2f(accY, accZ) * 180.0f / (float)M_PI;
+    float roll = atan2f(-accX, sqrtf(accY * accY + accZ * accZ)) * 180.0f / (float)M_PI;
+    float pitch  = atan2f(accY, accZ) * 180.0f / (float)M_PI;
 
     int16_t pitch_centi = (int16_t)(pitch * 100.0f); // centesimas de grado
     int16_t roll_centi  = (int16_t)(roll * 100.0f);
