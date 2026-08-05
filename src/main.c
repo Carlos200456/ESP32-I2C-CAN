@@ -25,6 +25,10 @@ static const char *TAG = "NODO_REMOTO";
 #define PERIODO_INCLINACION_MS  1000   // 1 Hz
 #define PERIODO_TEMPERATURA_MS  2000   // 0.5 Hz
 #define PERIODO_CALIBRACION_MS  200    // 5 Hz, solo mientras dura la calibracion
+// Muestreo del acelerometro para el promedio que consume enviar_inclinacion():
+// mas rapido que el envio (20 Hz -> ~20 muestras promediadas por segundo) para
+// filtrar el ruido de vibracion mecanica del sistema sin bloquear el loop.
+#define PERIODO_MUESTREO_INCLINACION_MS  50
 
 // ============================================================
 // app_main
@@ -72,6 +76,7 @@ void app_main(void) {
     TickType_t t_ultima_temperatura  = xTaskGetTickCount();
     TickType_t t_ultimo_chequeo_bus  = xTaskGetTickCount();
     TickType_t t_ultima_calibracion  = xTaskGetTickCount();
+    TickType_t t_ultima_muestra      = xTaskGetTickCount();
 
     // Recuperar valores de calibracion guardados en NVS (si existen).
     // Si nunca se calibro (primera instalacion), CalibracionValida
@@ -102,6 +107,12 @@ void app_main(void) {
             } else if (tecla == 'f' || tecla == 'F') {
                 calibracion_finalizar();
             }
+        }
+
+        if (!calibracion_en_curso() &&
+            (ahora - t_ultima_muestra) >= pdMS_TO_TICKS(PERIODO_MUESTREO_INCLINACION_MS)) {
+            t_ultima_muestra = ahora;
+            adxl345_muestrear();
         }
 
         if (!calibracion_en_curso() &&

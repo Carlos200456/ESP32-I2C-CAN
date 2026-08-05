@@ -40,6 +40,15 @@ bool adxl345_verificar_id(void);
  */
 esp_err_t adxl345_init(void);
 
+/**
+ * @brief Lee el ADXL345 y acumula la muestra cruda en un promedio movil que
+ * enviar_inclinacion() consume y reinicia en cada envio. Pensada para
+ * llamarse mas seguido que el envio de inclinacion (p.ej. 20 Hz) para filtrar
+ * el ruido de vibracion mecanica del sistema. Lecturas fallidas se descartan
+ * en silencio.
+ */
+void adxl345_muestrear(void);
+
 // ============================================================
 // MLX90614
 // ============================================================

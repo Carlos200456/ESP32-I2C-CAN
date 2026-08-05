@@ -28,6 +28,10 @@ static bool CalibracionInProgress = false; // seteado por comando CAN del Nano o
 static int AccelMinX = 0, AccelMaxX = 0;
 static int AccelMinY = 0, AccelMaxY = 0;
 static int AccelMinZ = 0, AccelMaxZ = 0;
+// Acumulador del promedio movil de inclinacion: adxl345_muestrear() lo llena
+// varias veces por segundo y enviar_inclinacion() lo consume y reinicia.
+static int32_t muestreoSumX = 0, muestreoSumY = 0, muestreoSumZ = 0;
+static uint16_t muestreoCount = 0;
 
 // Estado compartido con main.c (declarado extern en Globals.h).
 bool CalibracionValida = false;
@@ -136,6 +140,24 @@ static esp_err_t adxl345_leer_raw(int16_t *raw_x, int16_t *raw_y, int16_t *raw_z
     *raw_y = (int16_t)((data[3] << 8) | data[2]);
     *raw_z = (int16_t)((data[5] << 8) | data[4]);
     return ESP_OK;
+}
+
+// Acumula una lectura cruda para el promedio que consume enviar_inclinacion().
+// Pensada para llamarse mas seguido (p.ej. 20 Hz) que el envio de inclinacion
+// (1 Hz): promediar varias muestras por envio filtra el ruido de las
+// vibraciones mecanicas del sistema sin bloquear el loop principal. Si esta
+// lectura puntual falla, se descarta en silencio (no rompe el promedio en
+// curso); si el sensor esta realmente caido, enviar_inclinacion() lo detecta
+// por su cuenta al no tener muestras acumuladas.
+void adxl345_muestrear(void) {
+    int16_t raw_x, raw_y, raw_z;
+    if (adxl345_leer_raw(&raw_x, &raw_y, &raw_z) != ESP_OK) {
+        return;
+    }
+    muestreoSumX += raw_x;
+    muestreoSumY += raw_y;
+    muestreoSumZ += raw_z;
+    muestreoCount++;
 }
 
 // ============================================================
@@ -311,13 +333,36 @@ void enviar_inclinacion(void) {
         return;
     }
 
-    int16_t raw_x, raw_y, raw_z;
-    if (adxl345_leer_raw(&raw_x, &raw_y, &raw_z) != ESP_OK) {
-        ESP_LOGW(TAG, "Error leyendo ADXL345");
-        // Cambiar el color del LED a rojo para indicar fallo de sensor
-        ws2812_set_color(0, 0, 10); // Blue
-        return;
+    // Consumir el promedio acumulado por adxl345_muestrear() desde el ultimo
+    // envio: varias lecturas por segundo promediadas cancelan buena parte del
+    // ruido de vibracion que una lectura cruda unica no filtra. Si todavia no
+    // se acumulo ninguna muestra (arranque, o recien salio de calibracion),
+    // se hace una lectura directa para no perder el ciclo de envio.
+    int32_t sumX, sumY, sumZ;
+    uint16_t n = muestreoCount;
+    if (n == 0) {
+        int16_t raw_x, raw_y, raw_z;
+        if (adxl345_leer_raw(&raw_x, &raw_y, &raw_z) != ESP_OK) {
+            ESP_LOGW(TAG, "Error leyendo ADXL345");
+            // Cambiar el color del LED a rojo para indicar fallo de sensor
+            ws2812_set_color(0, 0, 10); // Blue
+            return;
+        }
+        sumX = raw_x;
+        sumY = raw_y;
+        sumZ = raw_z;
+        n = 1;
+    } else {
+        sumX = muestreoSumX;
+        sumY = muestreoSumY;
+        sumZ = muestreoSumZ;
+        muestreoSumX = muestreoSumY = muestreoSumZ = 0;
+        muestreoCount = 0;
     }
+    int16_t raw_x = (int16_t)(sumX / n);
+    int16_t raw_y = (int16_t)(sumY / n);
+    int16_t raw_z = (int16_t)(sumZ / n);
+
     // offsetX/gainX salen de AccelMin?/AccelMax?, que se calibran en
     // cuentas crudas (ver calibracion_paso): hay que restar/dividir en
     // ese mismo dominio para que el resultado quede normalizado a ~1g
