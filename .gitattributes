@@ -1,0 +1,31 @@
+# LF en el repositorio, CRLF en el working tree de Windows.
+# Evita que diffs y merges marquen archivos enteros como modificados.
+* text=auto
+
+# --- Fuente y configuracion (checkout con CRLF) ---
+*.c          text eol=crlf
+*.h          text eol=crlf
+*.cpp        text eol=crlf
+*.hpp        text eol=crlf
+*.ino        text eol=crlf
+*.pde        text eol=crlf
+*.ini        text eol=crlf
+*.json       text eol=crlf
+*.toml       text eol=crlf
+*.yml        text eol=crlf
+*.lock       text eol=crlf
+*.properties text eol=crlf
+*.md         text eol=crlf
+*.txt        text eol=crlf
+*.csv        text eol=crlf
+*.ptp        text eol=crlf
+
+# --- Binarios (git no los toca) ---
+*.jpg        binary
+*.png        binary
+*.pdf        binary
+*.odt        binary
+*.pdsprj     binary
+*.bin        binary
+*.hex        binary
+*.elf        binary
