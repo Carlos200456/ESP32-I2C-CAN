@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Componentes descargados por el gestor de ESP-IDF: se reconstruyen solos
+# desde idf_component.yml + dependencies.lock (que si se versiona).
+managed_components/
